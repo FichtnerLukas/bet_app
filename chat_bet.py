@@ -3,16 +3,60 @@ import pandas as pd
 import numpy as np
 import requests
 import matplotlib.pyplot as plt
+import seaborn as sns
 import datetime
 from scipy.stats import poisson
+from matplotlib.colors import LinearSegmentedColormap
 
 # -----------------------------
 # Page Configuration
 # -----------------------------
 st.set_page_config(page_title="Fußball-Wettanalyse", layout="wide", initial_sidebar_state="expanded")
 
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        color: #1E88E5;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .sub-header {
+        font-size: 1.8rem;
+        color: #0D47A1;
+        border-bottom: 2px solid #64B5F6;
+        padding-bottom: 0.5rem;
+        margin-top: 1.5rem;
+        margin-bottom: 1rem;
+    }
+    .metric-card {
+        background-color: #E3F2FD;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 1rem;
+    }
+    .team-header {
+        font-size: 1.4rem;
+        font-weight: bold;
+        color: #1565C0;
+        margin-bottom: 0.5rem;
+    }
+    .stProgress > div > div > div > div {
+        background-color: #1E88E5;
+    }
+    .footer {
+        text-align: center;
+        margin-top: 3rem;
+        padding: 1rem;
+        background-color: #E3F2FD;
+        border-radius: 0.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # --- Style Enhancements ---
-# A more professional and visually appealing style for plots
 plt.style.use('seaborn-v0_8-darkgrid')
 plt.rcParams.update({
     'font.family': 'sans-serif',
@@ -132,13 +176,21 @@ def get_table(league_short: str, season: int) -> pd.DataFrame:
     if not data:
         return pd.DataFrame()
 
-    rows = [{'team': t.get('teamName'), 'rank': t.get('place', t.get('rank')), 'points': t.get('points')} for t in data]
+    rows = []
+    for i, t in enumerate(data):
+        rows.append({
+            'team': t.get('teamName'), 
+            'rank': i + 1,  # Use index + 1 as rank
+            'points': t.get('points'),
+            'goals': f"{t.get('goals')}:{t.get('opponentGoals')}",
+            'matches': t.get('matches')
+        })
     return pd.DataFrame(rows)
 
 # -----------------------------
 # Analysis helpers
 # -----------------------------
-def compute_form(matches_df: pd.DataFrame, team: str, last_n: int = 3) -> dict:
+def compute_form(matches_df: pd.DataFrame, team: str, last_n: int = 5) -> dict:
     """Computes form over the last N finished games."""
     team_matches = matches_df[
         matches_df['finished'] &
@@ -147,11 +199,22 @@ def compute_form(matches_df: pd.DataFrame, team: str, last_n: int = 3) -> dict:
 
     points = 0
     results = []
+    goals_for = 0
+    goals_against = 0
+    
     for _, r in team_matches.iterrows():
-        if pd.isna(r['goals_home']) or pd.isna(r['goals_away']): continue
+        if pd.isna(r['goals_home']) or pd.isna(r['goals_away']): 
+            continue
 
         is_home = r['team_home'] == team
         home_goals, away_goals = r['goals_home'], r['goals_away']
+
+        if is_home:
+            goals_for += home_goals
+            goals_against += away_goals
+        else:
+            goals_for += away_goals
+            goals_against += home_goals
 
         if (is_home and home_goals > away_goals) or (not is_home and away_goals > home_goals):
             points += 3; results.append('W')
@@ -160,10 +223,17 @@ def compute_form(matches_df: pd.DataFrame, team: str, last_n: int = 3) -> dict:
         else:
             results.append('L')
 
-    return {'points': points, 'results': results, 'matches_considered': len(team_matches)}
+    return {
+        'points': points, 
+        'results': results, 
+        'matches_considered': len(team_matches),
+        'goals_for': goals_for,
+        'goals_against': goals_against,
+        'goal_difference': goals_for - goals_against
+    }
 
 def calculate_home_away_performance(matches_df: pd.DataFrame, team: str) -> dict:
-    """NEW: Analyzes a team's performance at home vs. away."""
+    """Analyzes a team's performance at home vs. away."""
     df = matches_df[matches_df['finished']].copy()
 
     # Home stats
@@ -193,9 +263,14 @@ def head2head(matches_df: pd.DataFrame, home: str, away: str, last_n: int = 10) 
     return matches_df[cond].sort_values('date', ascending=False).head(last_n)
 
 def predict_poisson(matches_df: pd.DataFrame, home: str, away: str) -> dict:
-    """Poisson-based prediction using season-long data."""
+    """Improved Poisson-based prediction using season-long data with form adjustment."""
     df = matches_df[matches_df['finished']].copy()
-
+    
+    # Get team form
+    home_form = compute_form(matches_df, home, last_n=5)
+    away_form = compute_form(matches_df, away, last_n=5)
+    
+    # Calculate base averages
     home_avg_scored = df[df['team_home'] == home]['goals_home'].mean()
     away_avg_conceded = df[df['team_away'] == away]['goals_home'].mean()
     away_avg_scored = df[df['team_away'] == away]['goals_away'].mean()
@@ -205,10 +280,22 @@ def predict_poisson(matches_df: pd.DataFrame, home: str, away: str) -> dict:
     league_avg_home_goals = df['goals_home'].mean()
     league_avg_away_goals = df['goals_away'].mean()
 
+    # Adjust for recent form (weight recent form more heavily)
+    form_weight = 0.3  # 30% weight to recent form
+    
+    # Home team attacking strength adjustment based on form
+    home_form_factor = 1 + (home_form['points'] / (3 * home_form['matches_considered']) - 0.5) * form_weight
     lam_home = (home_avg_scored if not pd.isna(home_avg_scored) else league_avg_home_goals) * \
-               (away_avg_conceded if not pd.isna(away_avg_conceded) else league_avg_away_goals) / league_avg_home_goals
+               (away_avg_conceded if not pd.isna(away_avg_conceded) else league_avg_away_goals) / league_avg_home_goals * home_form_factor
+
+    # Away team attacking strength adjustment based on form
+    away_form_factor = 1 + (away_form['points'] / (3 * away_form['matches_considered']) - 0.5) * form_weight
     lam_away = (away_avg_scored if not pd.isna(away_avg_scored) else league_avg_away_goals) * \
-               (home_avg_conceded if not pd.isna(home_avg_conceded) else league_avg_home_goals) / league_avg_away_goals
+               (home_avg_conceded if not pd.isna(home_avg_conceded) else league_avg_home_goals) / league_avg_away_goals * away_form_factor
+
+    # Ensure reasonable values
+    lam_home = max(0.1, min(lam_home, 4.0))
+    lam_away = max(0.1, min(lam_away, 4.0))
 
     max_goals = 10
     probs_home = [poisson.pmf(k, lam_home) for k in range(max_goals + 1)]
@@ -219,6 +306,12 @@ def predict_poisson(matches_df: pd.DataFrame, home: str, away: str) -> dict:
     p_draw = np.trace(mat)
     p_away = np.triu(mat, 1).sum()
 
+    # Normalize probabilities to sum to 1
+    total = p_home + p_draw + p_away
+    p_home /= total
+    p_draw /= total
+    p_away /= total
+
     score_probs = {f"{i}-{j}": mat[i, j] for i in range(6) for j in range(6)}
 
     total_goals_probs = {}
@@ -227,10 +320,17 @@ def predict_poisson(matches_df: pd.DataFrame, home: str, away: str) -> dict:
         total_goals_probs[f"over_{threshold}"] = over_prob
         total_goals_probs[f"under_{threshold}"] = 1 - over_prob
 
-    return {'p_home': p_home, 'p_draw': p_draw, 'p_away': p_away, 'score_probs': score_probs, 'total_goals_probs': total_goals_probs}
+    return {
+        'p_home': p_home, 
+        'p_draw': p_draw, 
+        'p_away': p_away, 
+        'score_probs': score_probs, 
+        'total_goals_probs': total_goals_probs,
+        'expected_goals': (lam_home, lam_away)
+    }
 
 def estimate_expected_goals(matches_df: pd.DataFrame, team: str) -> dict:
-    """IMPROVED: Estimates xG based on all season matches."""
+    """Estimates xG based on all season matches."""
     df = matches_df[matches_df['finished']].copy()
 
     home_matches = df[df['team_home'] == team]
@@ -257,8 +357,8 @@ def kelly_fraction(p: float, odds: float) -> float:
 # Visualization functions (IMPROVED & FANCY)
 # -----------------------------
 def plot_match_outcome_probabilities(p_home, p_draw, p_away, home_team, away_team):
-    """IMPROVED: Plots outcome probabilities with a modern design."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    """Plots outcome probabilities with a modern design."""
+    fig, ax = plt.subplots(figsize=(10, 6))
     outcomes = [f'Sieg {home_team}', 'Unentschieden', f'Sieg {away_team}']
     probs = [p_home * 100, p_draw * 100, p_away * 100]
     colors = ['#4A90E2', '#7F8C8D', '#E74C3C']
@@ -266,7 +366,7 @@ def plot_match_outcome_probabilities(p_home, p_draw, p_away, home_team, away_tea
     bars = ax.barh(outcomes, probs, color=colors, height=0.6)
     ax.invert_yaxis()
     ax.set_xlabel('Wahrscheinlichkeit (%)', fontsize=12, fontweight='bold')
-    ax.set_title(f'Wahrscheinlichkeit des Spielausgangs', pad=20)
+    ax.set_title(f'Wahrscheinlichkeit des Spielausgangs', pad=20, fontsize=16)
     ax.set_xlim(0, 100)
 
     # Remove spines
@@ -277,14 +377,15 @@ def plot_match_outcome_probabilities(p_home, p_draw, p_away, home_team, away_tea
     for bar in bars:
         width = bar.get_width()
         label_x_pos = width + 1
-        ax.text(label_x_pos, bar.get_y() + bar.get_height()/2, f'{width:.1f}%', va='center', ha='left', fontsize=12, fontweight='bold')
+        ax.text(label_x_pos, bar.get_y() + bar.get_height()/2, f'{width:.1f}%', 
+                va='center', ha='left', fontsize=12, fontweight='bold')
 
     plt.tight_layout()
     return fig
 
 def plot_score_probabilities(score_probs):
-    """IMPROVED: Plots top score probabilities as a clean bar chart."""
-    top_scores = sorted(score_probs.items(), key=lambda x: x[1], reverse=True)[:5]
+    """Plots top score probabilities as a clean bar chart."""
+    top_scores = sorted(score_probs.items(), key=lambda x: x[1], reverse=True)[:6]
     scores = [s[0] for s in top_scores]
     probs = [s[1] * 100 for s in top_scores]
 
@@ -292,7 +393,7 @@ def plot_score_probabilities(score_probs):
     bars = ax.bar(scores, probs, color='#4A90E2', width=0.6)
 
     ax.set_ylabel('Wahrscheinlichkeit (%)', fontsize=12, fontweight='bold')
-    ax.set_title('Wahrscheinlichste Endergebnisse', pad=20)
+    ax.set_title('Wahrscheinlichste Endergebnisse', pad=20, fontsize=16)
 
     # Clean up aesthetics
     ax.spines['top'].set_visible(False)
@@ -301,14 +402,15 @@ def plot_score_probabilities(score_probs):
 
     for bar in bars:
         height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height, f'{height:.1f}%', ha='center', va='bottom', fontsize=11, fontweight='bold')
+        ax.text(bar.get_x() + bar.get_width()/2., height, f'{height:.1f}%', 
+                ha='center', va='bottom', fontsize=11, fontweight='bold')
 
     ax.set_ylim(0, max(probs) * 1.15 if probs else 10)
     plt.tight_layout()
     return fig
 
 def plot_total_goals_probabilities(total_goals_probs):
-    """IMPROVED: Visualizes Over/Under probabilities with a modern aesthetic."""
+    """Visualizes Over/Under probabilities with a modern aesthetic."""
     thresholds = [0.5, 1.5, 2.5, 3.5, 4.5]
     over_probs = [total_goals_probs.get(f"over_{t}", 0) * 100 for t in thresholds]
     under_probs = [total_goals_probs.get(f"under_{t}", 0) * 100 for t in thresholds]
@@ -322,7 +424,7 @@ def plot_total_goals_probabilities(total_goals_probs):
 
     ax.set_xlabel('Tore', fontsize=12, fontweight='bold')
     ax.set_ylabel('Wahrscheinlichkeit (%)', fontsize=12, fontweight='bold')
-    ax.set_title('Über/Unter-Tore Wahrscheinlichkeit', pad=20)
+    ax.set_title('Über/Unter-Tore Wahrscheinlichkeit', pad=20, fontsize=16)
     ax.set_xticks(x)
     ax.set_xticklabels([f"{t}" for t in thresholds])
     ax.legend(frameon=False, fontsize=12)
@@ -334,7 +436,8 @@ def plot_total_goals_probabilities(total_goals_probs):
     def add_labels(bars):
         for bar in bars:
             height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height, f'{height:.1f}%', ha='center', va='bottom', fontsize=10)
+            ax.text(bar.get_x() + bar.get_width()/2., height, f'{height:.1f}%', 
+                    ha='center', va='bottom', fontsize=10)
 
     add_labels(bars1)
     add_labels(bars2)
@@ -344,7 +447,7 @@ def plot_total_goals_probabilities(total_goals_probs):
     return fig
 
 def plot_xg_comparison(xg_home, xg_away, home_team, away_team):
-    """IMPROVED: Plots a stylish xG comparison chart."""
+    """Plots a stylish xG comparison chart."""
     categories = ['xG For (Heim)', 'xG Against (Heim)', 'xG For (Auswärts)', 'xG Against (Auswärts)']
     values = [xg_home['home']['for'], xg_home['home']['against'], xg_away['away']['for'], xg_away['away']['against']]
 
@@ -353,7 +456,7 @@ def plot_xg_comparison(xg_home, xg_away, home_team, away_team):
     ax.bar_label(bars, fmt='%.2f', padding=3, fontweight='bold')
 
     ax.set_ylabel('Erwartete Tore pro Spiel', fontsize=12, fontweight='bold')
-    ax.set_title('Vergleich der erwarteten Tore (xG)', pad=20)
+    ax.set_title('Vergleich der erwarteten Tore (xG)', pad=20, fontsize=16)
 
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -364,19 +467,107 @@ def plot_xg_comparison(xg_home, xg_away, home_team, away_team):
     plt.tight_layout()
     return fig
 
+def plot_team_form_comparison(home_team, away_team, home_form, away_form):
+    """Plots a comparison of team form over the last 5 matches."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Create a color map for results
+    result_colors = {'W': '#2ECC71', 'D': '#F39C12', 'L': '#E74C3C'}
+    
+    # Plot home team form
+    home_colors = [result_colors[r] for r in home_form['results']]
+    ax1.bar(range(len(home_form['results'])), [1] * len(home_form['results']), color=home_colors)
+    ax1.set_xticks(range(len(home_form['results'])))
+    ax1.set_xticklabels(home_form['results'])
+    ax1.set_title(f'{home_team} - Form (letzte {home_form["matches_considered"]} Spiele)', fontsize=14)
+    ax1.set_ylim(0, 1)
+    ax1.set_yticks([])
+    
+    # Add points and goal difference to home team subplot
+    ax1.text(0.5, 0.8, f'Punkte: {home_form["points"]}/{3*home_form["matches_considered"]}', 
+             transform=ax1.transAxes, ha='center', fontsize=12, fontweight='bold')
+    ax1.text(0.5, 0.7, f'Tordiff.: {home_form["goal_difference"]:+.1f}', 
+             transform=ax1.transAxes, ha='center', fontsize=12)
+    
+    # Plot away team form
+    away_colors = [result_colors[r] for r in away_form['results']]
+    ax2.bar(range(len(away_form['results'])), [1] * len(away_form['results']), color=away_colors)
+    ax2.set_xticks(range(len(away_form['results'])))
+    ax2.set_xticklabels(away_form['results'])
+    ax2.set_title(f'{away_team} - Form (letzte {away_form["matches_considered"]} Spiele)', fontsize=14)
+    ax2.set_ylim(0, 1)
+    ax2.set_yticks([])
+    
+    # Add points and goal difference to home team subplot
+    ax1.text(0.5, 0.8, f'Punkte: {home_form["points"]}/{3*home_form["matches_considered"]}', 
+             transform=ax1.transAxes, ha='center', fontsize=12, fontweight='bold')
+    # Changed from :+d to :+.1f
+    ax1.text(0.5, 0.7, f'Tordiff.: {home_form["goal_difference"]:+.1f}', 
+         transform=ax1.transAxes, ha='center', fontsize=12)
+
+
+    # Plot away team form
+    away_colors = [result_colors[r] for r in away_form['results']]
+    ax2.bar(range(len(away_form['results'])), [1] * len(away_form['results']), color=away_colors)
+    ax2.set_xticks(range(len(away_form['results'])))
+    ax2.set_xticklabels(away_form['results'])
+    ax2.set_title(f'{away_team} - Form (letzte {away_form["matches_considered"]} Spiele)', fontsize=14)
+    ax2.set_ylim(0, 1)
+    ax2.set_yticks([])
+    
+    # Add points and goal difference to away team subplot
+    ax2.text(0.5, 0.8, f'Punkte: {away_form["points"]}/{3*away_form["matches_considered"]}', 
+             transform=ax2.transAxes, ha='center', fontsize=12, fontweight='bold')
+    # Changed from :+d to :+.1f
+    ax2.text(0.5, 0.7, f'Tordiff.: {away_form["goal_difference"]:+.1f}', 
+         transform=ax2.transAxes, ha='center', fontsize=12)
+    
+    plt.tight_layout()
+    return fig
+
+def plot_expected_goals_heatmap(exp_goals_home, exp_goals_away):
+    """Creates a heatmap of expected goals for the match."""
+    # Create a 2D grid of goal probabilities
+    max_goals = 5
+    home_probs = [poisson.pmf(i, exp_goals_home) for i in range(max_goals+1)]
+    away_probs = [poisson.pmf(i, exp_goals_away) for i in range(max_goals+1)]
+    probs_matrix = np.outer(home_probs, away_probs)
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(probs_matrix, cmap='YlOrRd')
+    
+    # Add text annotations
+    for i in range(max_goals+1):
+        for j in range(max_goals+1):
+            text = ax.text(j, i, f'{probs_matrix[i, j]:.3f}',
+                           ha="center", va="center", color="black", fontsize=10)
+    
+    ax.set_xticks(np.arange(max_goals+1))
+    ax.set_yticks(np.arange(max_goals+1))
+    ax.set_xlabel(f'{away_team} Tore', fontsize=12)
+    ax.set_ylabel(f'{home_team} Tore', fontsize=12)
+    ax.set_title('Erwartete Tore - Wahrscheinlichkeitsmatrix', fontsize=16, pad=20)
+    
+    # Add colorbar
+    cbar = ax.figure.colorbar(im, ax=ax)
+    cbar.ax.set_ylabel('Wahrscheinlichkeit', rotation=-90, va="bottom", fontsize=12)
+    
+    plt.tight_layout()
+    return fig
 
 # -----------------------------
 # UI / Main App
 # -----------------------------
-st.title("⚽ Fußball-Wettanalyse")
+st.markdown('<h1 class="main-header">⚽ Fußball-Wettanalyse</h1>', unsafe_allow_html=True)
 
 # --- Sidebar ---
-st.sidebar.header("Einstellungen")
-league_name = st.sidebar.selectbox("Liga", list(LEAGUES.keys()))
-league_short = LEAGUES[league_name]
-current_year = datetime.datetime.now().year
-season = st.sidebar.number_input("Saison (Startjahr)", min_value=2010, max_value=current_year + 1, value=current_year)
-st.sidebar.markdown("---")
+with st.sidebar:
+    st.header("Einstellungen")
+    league_name = st.selectbox("Liga", list(LEAGUES.keys()))
+    league_short = LEAGUES[league_name]
+    current_year = datetime.datetime.now().year
+    season = st.number_input("Saison (Startjahr)", min_value=2010, max_value=current_year + 1, value=current_year)
+    st.markdown("---")
 
 # --- Data Fetching ---
 with st.spinner("Lade Spieldaten..."):
@@ -396,38 +587,51 @@ if not upcoming_matches.empty:
     match_idx = match_options.index(selected_match_str)
     match_data = upcoming_matches.iloc[match_idx]
     home_team, away_team = match_data['team_home'], match_data['team_away']
+    match_date = match_data['date']
 else:
     st.info("Keine bevorstehenden Spiele für die ausgewählte Saison gefunden.")
     st.stop()
 
 # --- Main Page Content ---
-st.header(f"{league_name} | Saison {season}/{season+1}")
-st.subheader(f"Analyse: {home_team} vs. {away_team}")
-st.markdown("---")
+st.markdown(f'<h2 class="sub-header">{league_name} | Saison {season}/{season+1}</h2>', unsafe_allow_html=True)
+st.markdown(f'<h3 class="sub-header">Analyse: {home_team} vs. {away_team}</h3>', unsafe_allow_html=True)
+st.caption(f"Spieltermin: {match_date.strftime('%d.%m.%Y %H:%M')}")
 
 # --- Team Overview ---
 col1, col2 = st.columns(2)
+
 with col1:
-    st.markdown(f"#### {home_team} (Heim)")
-    home_form = compute_form(matches_df, home_team, last_n=3)
-    home_rank = table_df.loc[table_df['team'] == home_team, 'rank'].values
-    home_rank_display = int(home_rank[0]) if len(home_rank) > 0 and not pd.isna(home_rank[0]) else "N/A"
+    st.markdown(f'<div class="team-header">{home_team} (Heim)</div>', unsafe_allow_html=True)
+    home_form = compute_form(matches_df, home_team, last_n=5)
+    
+    # Get team rank from table
+    home_rank = table_df.index[table_df['team'] == home_team].tolist()
+    home_rank_display = home_rank[0] + 1 if home_rank else "N/A"
+    
     st.metric("Tabellenplatz", home_rank_display)
+    st.metric("Punkte", table_df.loc[table_df['team'] == home_team, 'points'].values[0] if home_rank else "N/A")
     st.metric(f"Form (letzte {home_form['matches_considered']} Spiele)", " ".join(home_form['results']) if home_form['results'] else "N/A")
 
 with col2:
-    st.markdown(f"#### {away_team} (Auswärts)")
-    away_form = compute_form(matches_df, away_team, last_n=3)
-    away_rank = table_df.loc[table_df['team'] == away_team, 'rank'].values
-    away_rank_display = int(away_rank[0]) if len(away_rank) > 0 and not pd.isna(away_rank[0]) else "N/A"
+    st.markdown(f'<div class="team-header">{away_team} (Auswärts)</div>', unsafe_allow_html=True)
+    away_form = compute_form(matches_df, away_team, last_n=5)
+    
+    # Get team rank from table
+    away_rank = table_df.index[table_df['team'] == away_team].tolist()
+    away_rank_display = away_rank[0] + 1 if away_rank else "N/A"
+    
     st.metric("Tabellenplatz", away_rank_display)
+    st.metric("Punkte", table_df.loc[table_df['team'] == away_team, 'points'].values[0] if away_rank else "N/A")
     st.metric(f"Form (letzte {away_form['matches_considered']} Spiele)", " ".join(away_form['results']) if away_form['results'] else "N/A")
 
+# --- Form Comparison Visualization ---
 st.markdown("---")
+st.markdown('<h3 class="sub-header">Formvergleich der Teams</h3>', unsafe_allow_html=True)
+st.pyplot(plot_team_form_comparison(home_team, away_team, home_form, away_form))
 
-
-# --- NEW FEATURE: Home vs. Away Performance ---
-st.subheader("🏠 Heim- vs. Auswärts-Performance")
+# --- Home vs. Away Performance ---
+st.markdown("---")
+st.markdown('<h3 class="sub-header">🏠 Heim- vs. Auswärts-Performance</h3>', unsafe_allow_html=True)
 home_perf = calculate_home_away_performance(matches_df, home_team)
 away_perf = calculate_home_away_performance(matches_df, away_team)
 
@@ -440,21 +644,46 @@ perf_data = {
     'Auswärts-Bilanz (W-D-L)': [f"{d['away']['W']}-{d['away']['D']}-{d['away']['L']}" for d in [home_perf, away_perf]],
     'Auswärtstore (F-A)': [f"{d['away']['GF']}-{d['away']['GA']}" for d in [home_perf, away_perf]],
 }
-# FIX: Deprecation warning for use_container_width
-st.dataframe(pd.DataFrame(perf_data), hide_index=True, use_container_width=True)
-st.markdown("---")
 
+st.dataframe(pd.DataFrame(perf_data), hide_index=True, use_container_width=True)
 
 # --- Head-to-Head ---
-st.subheader("Vergangene Begegnungen (H2H)")
+st.markdown("---")
+st.markdown('<h3 class="sub-header">Vergangene Begegnungen (H2H)</h3>', unsafe_allow_html=True)
 h2h_df = head2head(matches_df, home_team, away_team)
 if not h2h_df.empty:
-    # BUG FIX: Drop rows where score is missing to prevent crash
+    # Drop rows where score is missing to prevent crash
     h2h_display = h2h_df.dropna(subset=['goals_home', 'goals_away']).copy()
     if not h2h_display.empty:
         h2h_display['Datum'] = h2h_display['date'].dt.strftime('%d.%m.%Y')
         h2h_display['Ergebnis'] = h2h_display.apply(lambda r: f"{int(r['goals_home'])} - {int(r['goals_away'])}", axis=1)
-        # FIX: Deprecation warning for use_container_width
+        
+        # Calculate wins for each team
+        home_wins = 0
+        away_wins = 0
+        draws = 0
+        
+        for _, row in h2h_display.iterrows():
+            if row['goals_home'] > row['goals_away']:
+                if row['team_home'] == home_team:
+                    home_wins += 1
+                else:
+                    away_wins += 1
+            elif row['goals_home'] < row['goals_away']:
+                if row['team_home'] == home_team:
+                    away_wins += 1
+                else:
+                    home_wins += 1
+            else:
+                draws += 1
+        
+        # Display H2H summary
+        col1, col2, col3 = st.columns(3)
+        col1.metric(f"{home_team} Siege", home_wins)
+        col2.metric("Unentschieden", draws)
+        col3.metric(f"{away_team} Siege", away_wins)
+        
+        # Display H2H matches
         st.dataframe(h2h_display[['Datum', 'team_home', 'Ergebnis', 'team_away']].rename(
             columns={'team_home': 'Heim', 'team_away': 'Auswärts'}), hide_index=True, use_container_width=True)
     else:
@@ -462,14 +691,16 @@ if not h2h_df.empty:
 else:
     st.info("Keine direkten vergangenen Begegnungen in den Daten gefunden.")
 
-st.markdown("---")
-
 # --- Poisson Prediction & Visualizations ---
-st.header("Statistische Vorhersage & Analyse")
+st.markdown("---")
+st.markdown('<h2 class="sub-header">Statistische Vorhersage & Analyse</h2>', unsafe_allow_html=True)
 prediction = predict_poisson(matches_df, home_team, away_team)
 
 # Visuals first
 st.pyplot(plot_match_outcome_probabilities(prediction['p_home'], prediction['p_draw'], prediction['p_away'], home_team, away_team))
+
+# Expected goals heatmap
+st.pyplot(plot_expected_goals_heatmap(prediction['expected_goals'][0], prediction['expected_goals'][1]))
 
 tab1, tab2, tab3 = st.tabs(["Wahrscheinlichste Ergebnisse", "Über/Unter Tore", "Erwartete Tore (xG)"])
 with tab1:
@@ -482,11 +713,10 @@ with tab3:
     st.pyplot(plot_xg_comparison(xg_home, xg_away, home_team, away_team))
     st.caption(f"xG-Daten basieren auf {xg_home['home']['count']} Heimspielen für {home_team} und {xg_away['away']['count']} Auswärtsspielen für {away_team} in dieser Saison.")
 
-st.markdown("---")
-
 # --- Betting Analysis ---
-st.header("💰 Wettanalyse & Empfehlungen")
-with st.expander("Wettquoten & Bankroll eingeben"):
+st.markdown("---")
+st.markdown('<h2 class="sub-header">💰 Wettanalyse & Empfehlungen</h2>', unsafe_allow_html=True)
+with st.expander("Wettquoten & Bankroll eingeben", expanded=False):
     col1, col2, col3 = st.columns(3)
     with col1:
         home_odds = st.number_input("Heimsieg-Quote (1)", min_value=1.0, value=2.5, step=0.05)
@@ -504,7 +734,7 @@ kelly_home = kelly_fraction(prediction['p_home'], home_odds)
 kelly_draw = kelly_fraction(prediction['p_draw'], draw_odds)
 kelly_away = kelly_fraction(prediction['p_away'], away_odds)
 
-st.subheader("Analyse der Wettoptionen")
+st.markdown('<h3 class="sub-header">Analyse der Wettoptionen</h3>', unsafe_allow_html=True)
 col1, col2, col3 = st.columns(3)
 with col1:
     st.metric("EV Heimsieg", f"{ev_home*100:.2f}%", delta=f"{ev_home*100:.2f}%" if ev_home > 0 else None)
@@ -516,11 +746,14 @@ with col3:
     st.metric("EV Auswärtssieg", f"{ev_away*100:.2f}%", delta=f"{ev_away*100:.2f}%" if ev_away > 0 else None)
     st.metric("Kelly Auswärtssieg", f"{kelly_away*100:.1f}%", f"Einsatz: €{bankroll * kelly_away:.2f}")
 
-st.subheader("Wettempfehlungen (basierend auf positivem Erwartungswert)")
+st.markdown('<h3 class="sub-header">Wettempfehlungen</h3>', unsafe_allow_html=True)
 recommendations = []
-if ev_home > 0: recommendations.append(f"**Heimsieg ({home_team})** zu Quote {home_odds} (EV: {ev_home*100:.2f}%)")
-if ev_draw > 0: recommendations.append(f"**Unentschieden** zu Quote {draw_odds} (EV: {ev_draw*100:.2f}%)")
-if ev_away > 0: recommendations.append(f"**Auswärtssieg ({away_team})** zu Quote {away_odds} (EV: {ev_away*100:.2f}%)")
+if ev_home > 0: 
+    recommendations.append(f"**Heimsieg ({home_team})** zu Quote {home_odds} (EV: {ev_home*100:.2f}%)")
+if ev_draw > 0: 
+    recommendations.append(f"**Unentschieden** zu Quote {draw_odds} (EV: {ev_draw*100:.2f}%)")
+if ev_away > 0: 
+    recommendations.append(f"**Auswärtssieg ({away_team})** zu Quote {away_odds} (EV: {ev_away*100:.2f}%)")
 
 if recommendations:
     for rec in recommendations:
@@ -528,7 +761,18 @@ if recommendations:
 else:
     st.warning("Keine Wetten mit positivem Erwartungswert bei den aktuellen Quoten gefunden.")
 
+# --- League Table in Sidebar ---
 st.sidebar.markdown("---")
 if not table_df.empty:
-    st.sidebar.subheader("Aktuelle Tabelle")
-    st.sidebar.dataframe(table_df, hide_index=True, height=600)
+    st.sidebar.markdown("### Aktuelle Tabelle")
+    # Reset index to show rank properly
+    display_table = table_df.reset_index(drop=True)
+    display_table.index = display_table.index + 1
+    st.sidebar.dataframe(display_table[['team', 'points', 'goals', 'matches']], 
+                         use_container_width=True, height=600)
+
+# --- Footer ---
+st.markdown("---")
+st.markdown('<div class="footer">', unsafe_allow_html=True)
+st.markdown('**Datenquelle:** OpenLigaDB | **Haftungsausschluss:** Diese Analyse dient nur zu Informationszwecken und stellt keine Wettempfehlung dar.')
+st.markdown('</div>', unsafe_allow_html=True)
